@@ -17,6 +17,8 @@
 #include <MinHook.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdarg>
 
 IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -27,14 +29,31 @@ extern unsigned char embedded_font[];
 
 namespace er {
 
+static void diagLog(const wchar_t *fmt, ...) {
+    static FILE *logFile = nullptr;
+    if (!logFile) {
+        std::wstring path = std::wstring(gModulePath) + L"\\eroverlay_diag.log";
+        logFile = _wfopen(path.c_str(), L"w");
+        if (!logFile) return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    vfwprintf(logFile, fmt, args);
+    va_end(args);
+    fflush(logFile);
+}
+
 enum :int {
     NUM_BACK_BUFFERS = 3,
 };
 
 bool D3DRenderer::hook() {
+    diagLog(L"[hook] entering hook()\n");
     if (!createDevice()) {
+        diagLog(L"[hook] createDevice() FAILED\n");
         return false;
     }
+    diagLog(L"[hook] createDevice() succeeded\n");
 
     static MH_STATUS cscStatus = MH_CreateHook(fnCreateSwapChain_, reinterpret_cast<void*>(&hkCreateSwapChain), reinterpret_cast<void**>(&oCreateSwapChain_));
     static MH_STATUS cschStatus = MH_CreateHook(fnCreateSwapChainForHwndChain_, reinterpret_cast<void*>(&hkCreateSwapChainForHwnd), reinterpret_cast<void**>(&oCreateSwapChainForHwnd_));
@@ -50,6 +69,10 @@ bool D3DRenderer::hook() {
 
     static MH_STATUS eclStatus = MH_CreateHook(fnExecuteCommandLists_, reinterpret_cast<void*>(&hkExecuteCommandLists), reinterpret_cast<void**>(&oExecuteCommandLists_));
 
+    diagLog(L"[hook] MH_CreateHook results: csc=%d csch=%d csccw=%d cscc=%d present=%d present1=%d resize=%d srcSize=%d resize1=%d ecl=%d\n",
+            cscStatus, cschStatus, csccwStatus, csccStatus, presentStatus, present1Status,
+            resizeStatus, setSourceSizeStatus, resize1Status, eclStatus);
+
     MH_EnableHook(fnCreateSwapChain_);
     MH_EnableHook(fnCreateSwapChainForHwndChain_);
     MH_EnableHook(fnCreateSwapChainForCWindowChain_);
@@ -63,6 +86,8 @@ bool D3DRenderer::hook() {
     MH_EnableHook(fnResizeBuffers1_);
 
     MH_EnableHook(fnExecuteCommandLists_);
+
+    diagLog(L"[hook] all hooks enabled\n");
 
     initOverlay();
 
@@ -149,35 +174,48 @@ bool D3DRenderer::createDevice() {
 
     const HMODULE D3D12Module = GetModuleHandleW(L"d3d12.dll");
     const HMODULE DXGIModule = GetModuleHandleW(L"dxgi.dll");
+    diagLog(L"[createDevice] d3d12.dll=%p  dxgi.dll=%p\n",
+            static_cast<void *>(D3D12Module), static_cast<void *>(DXGIModule));
     void *CreateDXGIFactory1;
     IDXGIAdapter *Adapter = nullptr;
     void *D3D12CreateDevice;
     if (D3D12Module == nullptr || DXGIModule == nullptr) {
+        diagLog(L"[createDevice] FAILED: missing d3d12 or dxgi module\n");
         goto failed;
     }
 
     CreateDXGIFactory1 = reinterpret_cast<void *>(GetProcAddress(DXGIModule, "CreateDXGIFactory1"));
+    diagLog(L"[createDevice] CreateDXGIFactory1=%p\n", CreateDXGIFactory1);
     if (CreateDXGIFactory1 == nullptr) {
+        diagLog(L"[createDevice] FAILED: CreateDXGIFactory1 not found\n");
         goto failed;
     }
 
     if (reinterpret_cast<long (__stdcall *)(const IID &, void **)>(CreateDXGIFactory1)(IID_PPV_ARGS(&dxgiFactory)) != S_OK) {
+        diagLog(L"[createDevice] FAILED: CreateDXGIFactory1 call failed\n");
         goto failed;
     }
+    diagLog(L"[createDevice] dxgiFactory=%p\n", static_cast<void *>(dxgiFactory));
 
     if (dxgiFactory->EnumAdapters(0, &Adapter) == DXGI_ERROR_NOT_FOUND) {
+        diagLog(L"[createDevice] FAILED: no adapter found\n");
         goto failed;
     }
+    diagLog(L"[createDevice] adapter=%p\n", static_cast<void *>(Adapter));
 
     D3D12CreateDevice = reinterpret_cast<void *>(GetProcAddress(D3D12Module, "D3D12CreateDevice"));
+    diagLog(L"[createDevice] D3D12CreateDevice=%p\n", D3D12CreateDevice);
     if (D3D12CreateDevice == nullptr) {
+        diagLog(L"[createDevice] FAILED: D3D12CreateDevice not found\n");
         goto failed;
     }
 
     if (reinterpret_cast<long (__stdcall *)(IUnknown *, D3D_FEATURE_LEVEL, const IID &, void **)>(D3D12CreateDevice)(
         Adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d3dDevice)) != S_OK) {
+        diagLog(L"[createDevice] FAILED: D3D12CreateDevice call failed\n");
         goto failed;
     }
+    diagLog(L"[createDevice] d3dDevice=%p\n", static_cast<void *>(d3dDevice));
     Adapter->Release();
     Adapter = nullptr;
 
@@ -201,10 +239,13 @@ bool D3DRenderer::createDevice() {
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
 
         IDXGISwapChain1 *SwapChain;
-        if (dxgiFactory->CreateSwapChainForHwnd(d3dCommandQueue, hwnd, &sd, NULL, NULL, &SwapChain) != S_OK) {
+        HRESULT scHr = dxgiFactory->CreateSwapChainForHwnd(d3dCommandQueue, hwnd, &sd, NULL, NULL, &SwapChain);
+        diagLog(L"[createDevice] CreateSwapChainForHwnd hr=0x%08lX\n", scHr);
+        if (scHr != S_OK) {
             goto failed;
         }
         if (SwapChain->QueryInterface(IID_PPV_ARGS(&swapChain)) != S_OK) {
+            diagLog(L"[createDevice] FAILED: QueryInterface for IDXGISwapChain3\n");
             SwapChain->Release();
             goto failed;
         }
@@ -233,6 +274,12 @@ bool D3DRenderer::createDevice() {
 
         fnExecuteCommandLists_ = commandQueueVTable[10];
     }
+
+    diagLog(L"[createDevice] vtable hooks resolved:\n");
+    diagLog(L"  fnPresent_=%p  fnPresent1_=%p\n", fnPresent_, fnPresent1_);
+    diagLog(L"  fnResizeBuffers_=%p  fnResizeBuffers1_=%p\n", fnResizeBuffers_, fnResizeBuffers1_);
+    diagLog(L"  fnExecuteCommandLists_=%p\n", fnExecuteCommandLists_);
+    diagLog(L"  fnCreateSwapChain_=%p  fnCreateSwapChainForHwnd_=%p\n", fnCreateSwapChain_, fnCreateSwapChainForHwndChain_);
 
     swapChain->Release();
     d3dCommandQueue->Release();
@@ -281,7 +328,14 @@ void D3DRenderer::initOverlay() {
     io.IniFilename = nullptr;
 
     gameWindow_ = FindWindowW(L"ELDEN RING™", nullptr);
-    ImGui_ImplWin32_Init(gameWindow_);
+    diagLog(L"[initOverlay] FindWindowW(\"ELDEN RING™\")=%p\n", static_cast<void *>(gameWindow_));
+    if (!gameWindow_) {
+        // Try without the trademark symbol in case Wine reports a different title
+        gameWindow_ = FindWindowW(L"ELDEN RING", nullptr);
+        diagLog(L"[initOverlay] FindWindowW(\"ELDEN RING\") fallback=%p\n", static_cast<void *>(gameWindow_));
+    }
+    bool imguiOk = ImGui_ImplWin32_Init(gameWindow_);
+    diagLog(L"[initOverlay] ImGui_ImplWin32_Init=%d\n", imguiOk);
 }
 
 void D3DRenderer::SrvDescriptorAlloc(ImGui_ImplDX12_InitInfo* info, D3D12_CPU_DESCRIPTOR_HANDLE* pOutCpuDescHandle, D3D12_GPU_DESCRIPTOR_HANDLE* pOutGpuDescHandle) {
@@ -316,6 +370,9 @@ void D3DRenderer::HeapDescriptorFree(D3D12_CPU_DESCRIPTOR_HANDLE hCpuDescHandle,
 }
 
 void D3DRenderer::overlay(IDXGISwapChain3 *pSwapChain) {
+    static bool loggedEntry = false;
+    if (!loggedEntry) { diagLog(L"[overlay] FIRST CALL commandQueue_=%p\n", static_cast<void *>(commandQueue_)); loggedEntry = true; }
+
     if (commandQueue_ == nullptr)
         return;
 
@@ -325,7 +382,7 @@ void D3DRenderer::overlay(IDXGISwapChain3 *pSwapChain) {
     if (device_) {
         HRESULT hr = device_->GetDeviceRemovedReason();
         if (hr != S_OK) {
-            fwprintf(stderr, L"[EROverlay] D3D12 device lost (reason: 0x%08lX), disabling overlay\n", hr);
+            diagLog(L"[overlay] device lost reason=0x%08lX\n", hr);
             deviceLost_ = true;
             return;
         }
@@ -335,6 +392,7 @@ void D3DRenderer::overlay(IDXGISwapChain3 *pSwapChain) {
     pSwapChain->GetDesc(&sd);
 
     if (!ImGui::GetIO().BackendRendererUserData) {
+        diagLog(L"[overlay] initializing DX12 backend, buffers=%u format=%d\n", sd.BufferCount, sd.BufferDesc.Format);
         ID3D12Device* device;
         if (pSwapChain->GetDevice(IID_PPV_ARGS(&device)) != S_OK)
             return;
@@ -424,6 +482,7 @@ void D3DRenderer::overlay(IDXGISwapChain3 *pSwapChain) {
         ImGui_ImplDX12_Init(&init_info);
         ImGui::GetMainViewport()->PlatformHandleRaw = gameWindow_;
         oldWndProc_ = SetWindowLongPtrW(gameWindow_, GWLP_WNDPROC, (LONG_PTR)WndProc);
+        diagLog(L"[overlay] DX12 backend init done, oldWndProc_=0x%llX\n", static_cast<unsigned long long>(oldWndProc_));
         device->Release();
     }
     if (!backBuffer_) {
@@ -812,6 +871,8 @@ void D3DRenderer::CleanupRenderTarget() {
 }
 
 HRESULT WINAPI D3DRenderer::hkPresent(IDXGISwapChain3 *pSwapChain, UINT SyncInterval, UINT Flags) {
+    static bool once = false;
+    if (!once) { diagLog(L"[hkPresent] FIRST CALL pSwapChain=%p\n", static_cast<void *>(pSwapChain)); once = true; }
     gD3DRenderer->overlay(pSwapChain);
     HRESULT hr = gD3DRenderer->oPresent_(pSwapChain, SyncInterval, Flags);
     if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) && !gD3DRenderer->deviceLost_) {
@@ -825,6 +886,8 @@ HRESULT WINAPI D3DRenderer::hkPresent1(IDXGISwapChain3 *pSwapChain,
                                        UINT SyncInterval,
                                        UINT PresentFlags,
                                        const DXGI_PRESENT_PARAMETERS *pPresentParameters) {
+    static bool once = false;
+    if (!once) { diagLog(L"[hkPresent1] FIRST CALL pSwapChain=%p\n", static_cast<void *>(pSwapChain)); once = true; }
     gD3DRenderer->overlay(pSwapChain);
     HRESULT hr = gD3DRenderer->oPresent1_(pSwapChain, SyncInterval, PresentFlags, pPresentParameters);
     if ((hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) && !gD3DRenderer->deviceLost_) {
@@ -862,6 +925,8 @@ HRESULT WINAPI D3DRenderer::hkResizeBuffers1(IDXGISwapChain3 *pSwapChain,
 }
 
 void WINAPI D3DRenderer::hkExecuteCommandLists(ID3D12CommandQueue *pCommandQueue, UINT NumCommandLists, ID3D12CommandList *ppCommandLists) {
+    static bool once = false;
+    if (!once) { diagLog(L"[hkExecuteCommandLists] FIRST CALL pCommandQueue=%p\n", static_cast<void *>(pCommandQueue)); once = true; }
     if (!gD3DRenderer->commandQueue_)
         gD3DRenderer->commandQueue_ = pCommandQueue;
     return gD3DRenderer->oExecuteCommandLists_(pCommandQueue, NumCommandLists, ppCommandLists);
